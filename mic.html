@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NAO Voice Assistant</title>
+<style>
+body{background:#101827;color:#eef2ff;font:16px system-ui,Arial,sans-serif;margin:0;padding:35px 16px}
+main{max-width:660px;margin:auto}h1{font-size:2rem}p{line-height:1.5}
+.panel{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;margin:16px 0}
+button{background:#70d6b0;color:#071b15;border:0;border-radius:9px;font-weight:700;padding:13px 19px;cursor:pointer;font-size:1rem}
+button:disabled{opacity:.5;cursor:not-allowed}input{background:#0f172a;color:#fff;border:1px solid #64748b;border-radius:8px;padding:12px;width:76%;font:inherit}
+#status{color:#b8ffe6;font-weight:bold}#answer{white-space:pre-wrap}#heard{white-space:pre-wrap;min-height:1.4em}
+.note{font-size:.88rem;color:#cbd5e1}
+</style>
+</head>
+<body><main>
+<h1>🤖 NAO · Voice Assistant</h1>
+<p>Ask anything in <strong>English</strong>. Your question goes to local Qwen3; current weather uses Open-Meteo; NAO answers with its own voice.</p>
+<div class="panel">
+<p id="status" role="status">Ready. Click the microphone and allow access.</p>
+<button id="mic">🎤 Speak to NAO</button>
+<p class="note">Speak, then stop talking. Recognition ends automatically. The microphone stays off while NAO answers.</p>
+<p><strong>You:</strong> <span id="heard">—</span></p>
+</div>
+<div class="panel">
+<p><strong>NAO:</strong></p><p id="answer">—</p>
+</div>
+<div class="panel">
+<p><strong>Or type a question</strong> (useful for testing):</p>
+<form id="typeForm"><input id="typed" type="text" placeholder="Ask about robotics, weather..." maxlength="1000" required> <button id="send" type="submit">Send</button></form>
+</div>
+<p class="note">Browser speech recognition may send microphone audio to a browser provider. Qwen3 runs locally on your PC. For free local-only transcription, a separate compatible speech-to-text installation is needed.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const MicEngine = window.SpeechRecognition || window.webkitSpeechRecognition;
+let busy = false;
+let listening = false;
+let robotReady = false;
+let lastRobotReady = null;
+let recog = null;
+const status = s => { $('status').textContent = s; };
+function updateControls() {
+  const locked = busy || !robotReady;
+  $('send').disabled=locked;
+  $('typed').disabled=locked;
+  $('mic').disabled=locked || !MicEngine;
+}
+function setBusy(b) {
+  busy = b;
+  updateControls();
+}
+async function checkRobotMode() {
+  try {
+    const resp = await fetch('/status', {cache:'no-store'});
+    if (!resp.ok) throw new Error('Status unavailable');
+    const data = await resp.json();
+    robotReady = !!data.ready;
+    if (!busy && !listening) {
+      if (data.mode === 'dance_timeout') {
+        status('Dance did not report completion. Check Tai Chi Chuan onStopped -> LLM_CHAT onResume in Choregraphe.');
+      } else if (data.mode === 'dance') {
+        status('NAO is dancing. Waiting for the animation to finish...');
+      } else if (lastRobotReady !== robotReady) {
+        status(robotReady
+          ? 'LLM chat is ready again. You can speak to NAO!'
+          : 'Waiting for LLM_CHAT on the robot. If in emotion mode, say yes to return to chat.');
+      }
+    }
+    lastRobotReady = robotReady;
+    updateControls();
+  } catch (err) {
+    robotReady = false;
+    if (!busy && !listening) status('Cannot check NAO connection: ' + err.message);
+    updateControls();
+  }
+}
+setInterval(checkRobotMode, 2000);
+checkRobotMode();
+async function sendQuestion(question) {
+  if(busy || !question.trim()) return;
+  setBusy(true); status('Thinking and speaking on NAO...');
+  $('heard').textContent=question;
+  $('answer').textContent='Working...';
+  try {
+    const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question})});
+    const result=await r.json();
+    if(!r.ok) throw new Error(result.error||'Server error');
+    $('answer').textContent=result.answer;
+    if (result.action === 'emotion' && result.spoken) {
+      robotReady = false;
+      status('Emotion mode started. Say yes to the robot when it asks to return to chat.');
+      return;
+    }
+    if (result.action === 'dance' && result.spoken) {
+      robotReady = false;
+      status('Dance command accepted. Waiting for Tai Chi Chuan to finish...');
+      return;
+    }
+    status(result.spoken?'NAO finished. Ready for another question.':'Robot action/audio failed: '+result.speech_error);
+  } catch(err) {status('Error: '+err.message);$('answer').textContent='—';}
+  finally { setBusy(false); updateControls(); }
+}
+if(!MicEngine) {
+  $('mic').disabled=true;
+  status('Speech recognition unavailable in this browser. Open in Edge or Chrome, or type below.');
+} else {
+  recog = new MicEngine();
+  recog.lang='en-US';recog.continuous=false;recog.interimResults=true;
+  let finalText='';let interimText='';let problem='';
+  recog.onresult=(ev)=>{
+    interimText='';
+    for(let i=ev.resultIndex;i<ev.results.length;i++){
+      const words=ev.results[i][0].transcript;
+      if(ev.results[i].isFinal) finalText+=(finalText?' ':'')+words;
+      else interimText+=words;
+    }
+    $('heard').textContent=(finalText+' '+interimText).trim();
+  };
+  recog.onerror=(ev)=>{problem=ev.error;status('Microphone error: '+ev.error);};
+  recog.onend=()=>{
+    listening=false;$('mic').textContent='🎤 Speak to NAO';
+    const question=(finalText||interimText).trim();
+    if(question && !problem) sendQuestion(question);
+    else if(!problem) status('I did not catch that. Try speaking again.');
+  };
+  $('mic').onclick=()=>{
+    if(busy) return;
+    if(listening){recog.stop();return;}
+    finalText='';interimText='';problem='';$('heard').textContent='—';
+    status('Listening... speak English now.');
+    try {recog.start();listening=true;$('mic').textContent='⏹ Stop listening';}
+    catch(err){status('Cannot start microphone: '+err.message);}
+  };
+}
+$('typeForm').onsubmit=(e)=>{e.preventDefault();sendQuestion($('typed').value);$('typed').value='';};
+</script>
+</body></html>
